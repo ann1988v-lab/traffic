@@ -217,7 +217,8 @@ class Panel:
                 await self.reset()
                 self.stage(action)
                 prompts = {
-                    "message": "Пришлите текст объявления (до 4096 символов, без форматирования).",
+                    "message": "Пришлите текст объявления (до 4096 символов) либо одно фото/видео с подписью "
+                               "(до 1024 символов). Фото/видео — до 18 МБ. Без форматирования.",
                     "targets": "Пришлите ссылки на чаты / addlist по одной на строку. Можно .txt файлом. Пример:\n"
                                "https://t.me/your_group\nhttps://t.me/+invite_hash\nhttps://t.me/addlist/folder_slug\n"
                                "При запуске аккаунт вступит в недостающие чаты. Для заявок нужно одобрение администратора.",
@@ -310,7 +311,7 @@ class Panel:
         text = message.text or ""
         data = None
         try:
-            if message.document:
+            if message.document and stage != "message":
                 if not message.document.file_size or message.document.file_size > MAX_UPLOAD:
                     raise InputError("Размер файла должен быть от 1 байта до 18 МБ")
                 file = await message.document.get_file()
@@ -320,13 +321,48 @@ class Panel:
             if stage not in {"message", "targets", "timing"}:
                 await self.delete_secret(message)
             if stage == "message":
-                if not text.strip() or len(text.encode("utf-16-le")) // 2 > 4096:
-                    raise InputError("Пришлите непустой текст до 4096 символов Telegram")
+                photo = message.photo[-1] if message.photo else None
+                video = message.video
+                document = message.document
+                attachment = photo or video
+                kind = "photo" if photo else "video" if video else None
+                if not attachment and document:
+                    mime = document.mime_type or ""
+                    if mime in {"image/jpeg", "image/png"}:
+                        attachment, kind = document, "photo"
+                    elif mime.startswith("video/"):
+                        attachment, kind = document, "video"
+                if message.media_group_id:
+                    raise InputError("Пришлите одно фото или одно видео с подписью, без альбома")
+                if attachment:
+                    text = message.caption or ""
+                    if len(text.encode("utf-16-le")) // 2 > 1024:
+                        raise InputError("Подпись к фото/видео должна быть до 1024 символов Telegram")
+                    if not attachment.file_size or attachment.file_size > MAX_UPLOAD:
+                        raise InputError("Фото/видео должно быть размером до 18 МБ")
+                elif not text.strip() or len(text.encode("utf-16-le")) // 2 > 4096:
+                    raise InputError("Пришлите текст до 4096 символов либо фото/видео с подписью")
                 settings = self.store.settings()
                 settings["message"] = text
+                settings["media"] = None
+                if attachment:
+                    file = await attachment.get_file()
+                    data = bytes(await file.download_as_bytearray())
+                    if len(data) > MAX_UPLOAD:
+                        raise InputError("Фото/видео должно быть размером до 18 МБ")
+                    suffix = Path(getattr(attachment, "file_name", "") or "").suffix.lower()
+                    settings["media"] = {
+                        "id": self.store.save_media(data), "kind": kind,
+                        "name": "attachment" + (suffix or (".jpg" if kind == "photo" else ".mp4")),
+                        "mime_type": getattr(attachment, "mime_type", None),
+                        "width": getattr(attachment, "width", 0),
+                        "height": getattr(attachment, "height", 0),
+                        "duration": getattr(attachment, "duration", 0),
+                    }
                 self.store.set_settings(settings)
                 await self.reset()
-                await message.reply_text("Текст сохранён.", reply_markup=MENU)
+                await message.reply_text("Сообщение с вложением сохранено." if attachment else "Текст сохранён.",
+                                         reply_markup=MENU)
             elif stage == "targets":
                 targets = parse_targets(data.decode("utf-8-sig") if data else text)
                 settings = self.store.settings()
@@ -403,7 +439,7 @@ class Panel:
     async def preview(self, message):
         settings = self.store.settings()
         accounts = [a for a in self.store.accounts() if a["selected"]]
-        if not accounts or not settings["message"].strip() or not settings["targets"]:
+        if not accounts or not (settings["message"].strip() or settings.get("media")) or not settings["targets"]:
             raise InputError("Нужны выбранный аккаунт, текст сообщения и ссылки")
         await message.reply_text("Проверяю ссылки и собираю план. Вступлений и отправок пока нет.")
         snapshot = {**settings, "accounts": []}
@@ -439,6 +475,8 @@ class Panel:
             f"Пауза между действиями: {settings['delay']} сек.\n"
             f"Повторение: {str(settings['repeat']) + ' сек. после цикла' if settings['repeat'] else 'один цикл'}.\n\n"
             f"Текст:\n{settings['message'][:700]}\n\n"
+            + (f"Вложение: {'фото' if settings['media']['kind'] == 'photo' else 'видео'}\n\n"
+               if settings.get("media") else "") +
             "Нажатие «Запустить» выполнит вступления и рассылку из этого плана.",
             reply_markup=keyboard([[("Запустить", f"run:{job_id}"), ("В меню", "menu")]]))
 
@@ -487,7 +525,8 @@ def build_app():
     app.add_handler(CommandHandler("status", panel.status))
     app.add_handler(CallbackQueryHandler(panel.callback))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE &
-                                   (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, panel.content))
+                                   (filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.VIDEO)
+                                   & ~filters.COMMAND, panel.content))
     app.add_error_handler(panel.on_error)
     return app
 
