@@ -1,5 +1,6 @@
-"""Private Telegram control panel. Entry point for PyCharm and BotHost."""
+"""Telegram control panel with separate private workspaces for every user."""
 import asyncio
+from contextlib import closing
 import csv
 import io
 import json
@@ -8,11 +9,13 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sqlite3
 import time
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Keyboard
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import (Application, BaseUpdateProcessor, CallbackQueryHandler,
+                          CommandHandler, MessageHandler, filters)
 from telethon import errors
 from telethon.sessions import StringSession
 
@@ -87,10 +90,6 @@ class Panel:
             await app.bot.send_message(self.owner, text)
         self.runner = Runner(self.store, notify)
         self.expiry_task = asyncio.create_task(self.expire())
-        await app.bot.set_my_commands([
-            ("start", "Меню"), ("id", "Мой Telegram ID"),
-            ("cancel", "Отменить ввод"), ("stop", "Остановить рассылку"),
-            ("status", "Статус задач")])
 
     async def expire(self):
         while True:
@@ -500,6 +499,107 @@ class Panel:
         logging.getLogger("panel").error("Handler failed: %s", type(context.error).__name__)
 
 
+def migrate_legacy(data_dir, legacy_owner):
+    """Copy the previous private workspace to its owner; never give it to a new visitor."""
+    data_dir = Path(data_dir)
+    source = data_dir / "bot.sqlite3"
+    marker = data_dir / "legacy-migrated.json"
+    if not source.exists() or marker.exists():
+        return
+    try:
+        user_id = int(legacy_owner or 0)
+    except ValueError:
+        user_id = 0
+    if user_id <= 0:
+        raise InputError("Для переноса прежних данных оставьте прежний OWNER_ID на первый запуск. "
+                         "После переноса переменную можно удалить; она не ограничивает доступ")
+    destination = data_dir / "users" / str(user_id) / "bot.sqlite3"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        with closing(sqlite3.connect(destination)) as db:
+            try:
+                row = db.execute("SELECT owner FROM legacy_import WHERE id=1").fetchone()
+            except sqlite3.OperationalError:
+                row = None
+        if not row or row[0] != user_id:
+            raise InputError("Перенос остановлен: у прежнего владельца уже есть отдельное хранилище. "
+                             "Существующие данные не перезаписаны")
+    else:
+        temporary = destination.with_suffix(".importing")
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as src:
+            with closing(sqlite3.connect(temporary)) as dst:
+                src.backup(dst)
+                dst.execute("CREATE TABLE IF NOT EXISTS legacy_import(id INTEGER PRIMARY KEY,owner INTEGER)")
+                dst.execute("INSERT OR REPLACE INTO legacy_import VALUES(1,?)", (user_id,))
+                dst.commit()
+        temporary.replace(destination)
+    marker.write_text(json.dumps({"user_id": user_id}), encoding="utf-8")
+
+
+class PerUserProcessor(BaseUpdateProcessor):
+    """Keep each user's input ordered while other users can work independently."""
+    def __init__(self):
+        super().__init__(16)
+        self.locks = {}
+
+    async def initialize(self):
+        pass
+
+    async def shutdown(self):
+        self.locks.clear()
+
+    async def do_process_update(self, update, coroutine):
+        user = getattr(update, "effective_user", None)
+        key = user.id if user else None
+        async with self.locks.setdefault(key, asyncio.Lock()):
+            await coroutine
+
+
+class PublicPanel:
+    def __init__(self, root, key, default_id, default_hash):
+        self.root = Path(root).resolve()
+        self.key = key
+        self.default_id = default_id
+        self.default_hash = default_hash
+        self.panels = {}
+
+    async def post_init(self, app):
+        await app.bot.set_my_commands([
+            ("start", "Меню"), ("id", "Мой Telegram ID"),
+            ("cancel", "Отменить ввод"), ("stop", "Остановить рассылку"),
+            ("status", "Статус задач")])
+
+    async def user_panel(self, user_id, app):
+        if user_id not in self.panels:
+            store = Store(self.root / "users" / str(user_id), self.key)
+            panel = Panel(store, user_id, self.default_id, self.default_hash)
+            self.panels[user_id] = panel
+            await panel.post_init(app)
+        return self.panels[user_id]
+
+    def route(self, method):
+        async def dispatch(update, context):
+            if (not update.effective_user or not update.effective_chat
+                    or update.effective_chat.type != "private"):
+                if update.callback_query:
+                    await update.callback_query.answer("Откройте личный чат с ботом")
+                return
+            panel = await self.user_panel(update.effective_user.id, context.application)
+            await getattr(panel, method)(update, context)
+        return dispatch
+
+    async def post_stop(self, app):
+        await asyncio.gather(*(panel.post_stop(app) for panel in self.panels.values()))
+
+    async def post_shutdown(self, app):
+        for panel in self.panels.values():
+            panel.store.close()
+        self.panels.clear()
+
+    async def on_error(self, update, context):
+        logging.getLogger("panel").error("Handler failed: %s", type(context.error).__name__)
+
+
 def build_app():
     load_dotenv(ROOT / ".env")
     token = os.environ.get("BOT_TOKEN", "")
@@ -507,26 +607,28 @@ def build_app():
     if not token or not key:
         raise InputError("Заполните BOT_TOKEN и ENCRYPTION_KEY в .env или настройках BotHost")
     try:
-        owner = int(os.environ.get("OWNER_ID", "0"))
         default_id = int(os.environ.get("TELEGRAM_API_ID", "0"))
     except ValueError:
-        raise InputError("OWNER_ID и TELEGRAM_API_ID должны быть числами") from None
+        raise InputError("TELEGRAM_API_ID должен быть числом") from None
     default_hash = os.environ.get("TELEGRAM_API_HASH", "")
-    data_dir = Path(os.environ.get("DATA_DIR", str(ROOT / "data")))
-    store = Store(data_dir, key)
-    panel = Panel(store, owner, default_id, default_hash)
-    app = (Application.builder().token(token).concurrent_updates(False)
+    data_dir = Path(os.environ.get("DATA_DIR", str(ROOT / "data"))).resolve()
+    # Validate the encryption key even before the first visitor creates a workspace.
+    from cryptography.fernet import Fernet
+    Fernet(key.encode())
+    migrate_legacy(data_dir, os.environ.get("OWNER_ID"))
+    panel = PublicPanel(data_dir, key, default_id, default_hash)
+    app = (Application.builder().token(token).concurrent_updates(PerUserProcessor())
            .post_init(panel.post_init).post_stop(panel.post_stop)
            .post_shutdown(panel.post_shutdown).build())
-    app.add_handler(CommandHandler("start", panel.start))
-    app.add_handler(CommandHandler("id", panel.identify))
-    app.add_handler(CommandHandler("cancel", panel.cancel))
-    app.add_handler(CommandHandler("stop", panel.stop))
-    app.add_handler(CommandHandler("status", panel.status))
-    app.add_handler(CallbackQueryHandler(panel.callback))
+    app.add_handler(CommandHandler("start", panel.route("start")))
+    app.add_handler(CommandHandler("id", panel.route("identify")))
+    app.add_handler(CommandHandler("cancel", panel.route("cancel")))
+    app.add_handler(CommandHandler("stop", panel.route("stop")))
+    app.add_handler(CommandHandler("status", panel.route("status")))
+    app.add_handler(CallbackQueryHandler(panel.route("callback")))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE &
                                    (filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.VIDEO)
-                                   & ~filters.COMMAND, panel.content))
+                                   & ~filters.COMMAND, panel.route("content")))
     app.add_error_handler(panel.on_error)
     return app
 
