@@ -1,5 +1,6 @@
 """Read-only planning, then explicit join/send execution of the saved plan."""
 import asyncio
+import io
 import re
 from urllib.parse import urlparse
 
@@ -195,8 +196,23 @@ class Runner:
                                 raise asyncio.CancelledError()
                             if not self.store.claim(job_id, cycle, account_id, item["id"]):
                                 continue
-                            await client.send_message(input_peer(item), snapshot["message"],
-                                                      parse_mode=None, link_preview=False)
+                            media = snapshot.get("media")
+                            if media:
+                                file = io.BytesIO(self.store.read_media(media["id"]))
+                                file.name = media["name"]
+                                kwargs = {}
+                                if media["kind"] == "video":
+                                    kwargs["mime_type"] = media.get("mime_type") or "video/mp4"
+                                    kwargs["supports_streaming"] = kwargs["mime_type"] == "video/mp4"
+                                    kwargs["attributes"] = [types.DocumentAttributeVideo(
+                                        duration=media.get("duration") or 0,
+                                        w=media.get("width") or 0, h=media.get("height") or 0,
+                                        supports_streaming=kwargs["supports_streaming"])]
+                                await client.send_file(input_peer(item), file, caption=snapshot["message"],
+                                                       parse_mode=None, force_document=False, **kwargs)
+                            else:
+                                await client.send_message(input_peer(item), snapshot["message"],
+                                                          parse_mode=None, link_preview=False)
                             self.store.sent(job_id, cycle, account_id, item["id"])
                             total += 1
                             self.store.state(job_id, "running", f"За текущий запуск отправлено: {total}")
