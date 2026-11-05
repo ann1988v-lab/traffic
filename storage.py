@@ -1,5 +1,6 @@
 """Persistent state. Session strings and API credentials are encrypted at rest."""
 import json
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -27,6 +28,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS deliveries
                 (job TEXT, cycle INTEGER, account INTEGER, chat TEXT, status TEXT,
                  PRIMARY KEY(job,cycle,account,chat));
+            CREATE TABLE IF NOT EXISTS media (id TEXT PRIMARY KEY, data BLOB);
         """)
         self.db.execute("UPDATE jobs SET state='interrupted',detail='Процесс перезапущен' "
                         "WHERE state='running'")
@@ -54,6 +56,18 @@ class Store:
     def set_settings(self, value):
         self.db.execute("INSERT OR REPLACE INTO settings VALUES(1,?)", (self.encrypt(value),))
         self.db.commit()
+
+    def save_media(self, data):
+        media_id = secrets.token_hex(16)
+        self.db.execute("INSERT INTO media VALUES(?,?)", (media_id, self.cipher.encrypt(data)))
+        self.db.commit()
+        return media_id
+
+    def read_media(self, media_id):
+        row = self.db.execute("SELECT data FROM media WHERE id=?", (media_id,)).fetchone()
+        if not row:
+            raise ValueError("Вложение не найдено. Задайте сообщение заново и создайте новый план")
+        return self.cipher.decrypt(row[0])
 
     def accounts(self):
         return [dict(r) for r in self.db.execute("SELECT id,label,selected FROM accounts ORDER BY id")]
