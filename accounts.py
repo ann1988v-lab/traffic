@@ -175,10 +175,20 @@ def error_text(error):
         "InviteRequestSentError": "Заявка на вступление отправлена; нужно одобрение администратора.",
         "ChatWriteForbiddenError": "У аккаунта нет права писать в этот чат.",
         "UserBannedInChannelError": "Аккаунт заблокирован в этом чате.",
+        "ChannelPrivateError": "Нет доступа к группе или каналу.",
+        "ChatAdminRequiredError": "Для этого действия нужны права администратора.",
+        "ChatSendMediaForbiddenError": "В этом чате запрещена отправка медиа.",
+        "ChatSendPhotosForbiddenError": "В этом чате запрещены фотографии.",
+        "ChatSendVideosForbiddenError": "В этом чате запрещены видео.",
+        "ChatSendPlainForbiddenError": "В этом чате запрещены текстовые сообщения.",
+        "UserNotParticipantError": "Аккаунт не состоит в этом чате.",
+        "ChannelsTooMuchError": "Достигнут лимит групп и каналов аккаунта.",
+        "InviteHashExpiredError": "Ссылка приглашения истекла.",
+        "InviteHashInvalidError": "Недействительная ссылка приглашения или папки.",
         "PeerFloodError": "Telegram ограничил действия аккаунта. Задача остановлена.",
         "TimeoutError": "Сеть не ответила вовремя. Проверьте статус задачи перед повтором.",
         "ConnectionError": "Нет соединения с Telegram.",
     }
     if hasattr(error, "seconds"):
-        return f"{name}: Telegram требует ждать {int(error.seconds)} сек. Задача остановлена."
+        return f"{name}: Telegram требует ждать {int(error.seconds)} сек."
     return f"{name}: {explanations.get(name, 'Операция не выполнена. Проверьте формат данных и доступ аккаунта.')}"
