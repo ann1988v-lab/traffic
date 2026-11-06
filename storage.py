@@ -8,7 +8,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 
-DEFAULTS = {"message": "", "targets": [], "delay": 30, "repeat": 0}
+DEFAULTS = {"message": "", "targets": [], "delay": 30, "repeat": 0, "cycles": 1}
 
 
 class Store:
@@ -30,6 +30,14 @@ class Store:
                  PRIMARY KEY(job,cycle,account,chat));
             CREATE TABLE IF NOT EXISTS media (id TEXT PRIMARY KEY, data BLOB);
         """)
+        for table, columns in {
+            "deliveries": {"title": "TEXT DEFAULT ''", "source": "TEXT DEFAULT ''", "reason": "TEXT DEFAULT ''"},
+            "jobs": {"cycle": "INTEGER DEFAULT 0"},
+        }.items():
+            present = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            for column, definition in columns.items():
+                if column not in present:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         self.db.execute("UPDATE jobs SET state='interrupted',detail='Процесс перезапущен' "
                         "WHERE state='running'")
         self.db.commit()
@@ -93,7 +101,7 @@ class Store:
         self.db.commit()
 
     def new_job(self, job_id, snapshot):
-        self.db.execute("INSERT INTO jobs VALUES(?,'draft',?,'',?)",
+        self.db.execute("INSERT INTO jobs(id,state,snapshot,detail,created) VALUES(?,'draft',?,'',?)",
                         (job_id, self.encrypt(snapshot), time.time()))
         self.db.commit()
 
@@ -113,16 +121,35 @@ class Store:
         self.db.execute("UPDATE jobs SET state=?,detail=? WHERE id=?", (state, detail, job_id))
         self.db.commit()
 
-    def claim(self, job_id, cycle, account_id, chat):
-        cur = self.db.execute("INSERT OR IGNORE INTO deliveries VALUES(?,?,?,?,'pending')",
-                              (job_id, cycle, account_id, str(chat)))
+    def progress(self, job_id, cycle):
+        self.db.execute("UPDATE jobs SET cycle=? WHERE id=?", (cycle, job_id))
+        self.db.commit()
+
+    def recorded(self, job_id, cycle, account_id, chat):
+        return self.db.execute("SELECT 1 FROM deliveries WHERE job=? AND cycle=? AND account=? AND chat=?",
+                               (job_id, cycle, account_id, str(chat))).fetchone() is not None
+
+    def claim(self, job_id, cycle, account_id, chat, title="", source=""):
+        cur = self.db.execute("INSERT OR IGNORE INTO deliveries "
+                              "(job,cycle,account,chat,status,title,source) VALUES(?,?,?,?,'pending',?,?)",
+                              (job_id, cycle, account_id, str(chat), title, source))
         self.db.commit()
         return cur.rowcount == 1
 
     def sent(self, job_id, cycle, account_id, chat):
-        self.db.execute("UPDATE deliveries SET status='sent' "
+        self.db.execute("UPDATE deliveries SET status='sent',reason='' "
                         "WHERE job=? AND cycle=? AND account=? AND chat=?",
                         (job_id, cycle, account_id, str(chat)))
+        self.db.commit()
+
+    def failed(self, job_id, cycle, account_id, item, reason, uncertain=False):
+        values = (job_id, cycle, account_id, str(item["id"]),
+                  "pending" if uncertain else "failed", item.get("title", ""),
+                  item.get("source", ""), reason)
+        self.db.execute("INSERT INTO deliveries(job,cycle,account,chat,status,title,source,reason) "
+                        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job,cycle,account,chat) DO UPDATE SET "
+                        "status=excluded.status,reason=excluded.reason,title=excluded.title,source=excluded.source "
+                        "WHERE deliveries.status != 'sent'", values)
         self.db.commit()
 
     def deliveries(self, job_id):
